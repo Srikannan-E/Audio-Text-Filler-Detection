@@ -2,9 +2,8 @@ import { useState, useRef, useCallback, useEffect } from 'react'
 import { create } from 'zustand'
 
 // ─── Config ────────────────────────────────────────────────────────────────
-const API_URL      = import.meta.env.VITE_API_URL      ?? 'http://localhost:8001'
+const API_URL      = import.meta.env.VITE_API_URL      ?? 'http://localhost:8000'
 const SARVAM_KEY   = import.meta.env.VITE_SARVAM_API_KEY ?? ''
-const CHUNK_MS     = 25000   // 25 s per audio chunk — under Sarvam free-tier 28 s cap
 const MAX_HIST     = 40      // max points on charts
 
 // ─── Zustand store ─────────────────────────────────────────────────────────
@@ -95,21 +94,26 @@ const useStore = create((set, get) => ({
 }))
 
 // ─── useAudioCapture hook ───────────────────────────────────────────────────
+// Records the FULL session as one blob and sends it on Stop —
+// identical to the curl test that works perfectly.
+// The free-tier 28s Sarvam limit is handled by the backend splitting
+// the audio if needed, not by the frontend chunking.
 function useAudioCapture() {
-  const recorderRef      = useRef(null)
-  const chunksRef        = useRef([])
-  const flushTimerRef    = useRef(null)
-  const tickTimerRef     = useRef(null)
-  const streamRef        = useRef(null)
-  const isRunningRef     = useRef(false)
-  const chunkStartRef    = useRef(null)   // for countdown ring
+  const recorderRef   = useRef(null)
+  const allBlobsRef   = useRef([])     // accumulates ALL data throughout session
+  const tickTimerRef  = useRef(null)
+  const streamRef     = useRef(null)
+  const isRunningRef  = useRef(false)
+  const [isPosting, setIsPosting] = useState(false)
 
-  const { setListening, setError, addChunk, tick, reset } = useStore()
+  const { setListening, setError, addChunk, tick } = useStore()
 
-  const postChunk = useCallback(async (blob) => {
-    if (!blob || blob.size < 500) return
+  const postFull = useCallback(async (blobs) => {
+    if (!blobs.length) return
+    setIsPosting(true)
+    const blob = new Blob(blobs, { type: 'audio/webm' })
     const form = new FormData()
-    form.append('file',    blob, 'chunk.webm')
+    form.append('file',    blob, 'recording.webm')
     form.append('api_key', SARVAM_KEY)
     try {
       const res  = await fetch(`${API_URL}/transcribe`, { method: 'POST', body: form })
@@ -118,25 +122,10 @@ function useAudioCapture() {
       if (data.transcript) addChunk(data.transcript, data.segments ?? [], data.fillerCounts ?? {})
     } catch (e) {
       setError(`Network error: ${e.message}`)
+    } finally {
+      setIsPosting(false)
     }
   }, [addChunk, setError])
-
-  const startRecorder = useCallback(() => {
-    if (!streamRef.current) return
-    const rec = new MediaRecorder(streamRef.current, { mimeType: 'audio/webm;codecs=opus' })
-    chunksRef.current = []
-    rec.ondataavailable = e => { if (e.data.size > 0) chunksRef.current.push(e.data) }
-    rec.onstop = () => {
-      const blob = new Blob(chunksRef.current, { type: 'audio/webm' })
-      chunksRef.current = []
-      postChunk(blob)
-      chunkStartRef.current = Date.now()
-      if (isRunningRef.current) startRecorder()
-    }
-    rec.start()
-    recorderRef.current  = rec
-    chunkStartRef.current = Date.now()
-  }, [postChunk])
 
   const start = useCallback(async () => {
     if (isRunningRef.current) return
@@ -145,22 +134,31 @@ function useAudioCapture() {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
       streamRef.current    = stream
       isRunningRef.current = true
+      allBlobsRef.current  = []
+
+      const rec = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' })
+
+      // Every dataavailable event appends to the master list — never cleared until reset
+      rec.ondataavailable = e => { if (e.data.size > 0) allBlobsRef.current.push(e.data) }
+
+      // When stopped, send everything accumulated so far
+      rec.onstop = () => postFull(allBlobsRef.current)
+
+      rec.start(1000)   // collect a blob every 1s so ondataavailable fires regularly
+      recorderRef.current = rec
+
       setListening(true)
       setError(null)
-      startRecorder()
-      flushTimerRef.current = setInterval(() => {
-        if (recorderRef.current?.state === 'recording') recorderRef.current.stop()
-      }, CHUNK_MS)
       tickTimerRef.current = setInterval(tick, 1000)
     } catch (e) {
       setError(`Mic error: ${e.message}`)
     }
-  }, [startRecorder, setListening, setError, tick])
+  }, [postFull, setListening, setError, tick])
 
   const stop = useCallback(() => {
     isRunningRef.current = false
-    clearInterval(flushTimerRef.current)
     clearInterval(tickTimerRef.current)
+    // stop() triggers onstop → postFull with the complete recording
     if (recorderRef.current?.state === 'recording') recorderRef.current.stop()
     streamRef.current?.getTracks().forEach(t => t.stop())
     streamRef.current = null
@@ -169,7 +167,7 @@ function useAudioCapture() {
 
   useEffect(() => () => { isRunningRef.current = false; stop() }, [stop])
 
-  return { start, stop, chunkStartRef }
+  return { start, stop, isPosting }
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -185,45 +183,10 @@ function scoreColor(score) {
   return '#ef4444'
 }
 
-// ─── CountdownRing ──────────────────────────────────────────────────────────
-function CountdownRing({ chunkStartRef }) {
-  const [left, setLeft] = useState(CHUNK_MS / 1000)
-  useEffect(() => {
-    const id = setInterval(() => {
-      if (!chunkStartRef.current) return
-      const elapsed = (Date.now() - chunkStartRef.current) / 1000
-      setLeft(Math.max(0, Math.round(CHUNK_MS / 1000 - elapsed)))
-    }, 500)
-    return () => clearInterval(id)
-  }, [chunkStartRef])
-
-  const total  = CHUNK_MS / 1000
-  const r      = 16
-  const circ   = 2 * Math.PI * r
-  const offset = circ * (1 - left / total)
-  const color  = left > 10 ? '#22c55e' : left > 5 ? '#f59e0b' : '#ef4444'
-
-  return (
-    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2 }}>
-      <svg width={40} height={40} viewBox="0 0 40 40">
-        <circle cx={20} cy={20} r={r} fill="none" stroke="#e2e8f0" strokeWidth={3}/>
-        <circle cx={20} cy={20} r={r} fill="none" stroke={color} strokeWidth={3}
-          strokeDasharray={circ} strokeDashoffset={offset} strokeLinecap="round"
-          transform="rotate(-90 20 20)"
-          style={{ transition: 'stroke-dashoffset 0.5s linear, stroke 0.5s' }}/>
-        <text x={20} y={24} textAnchor="middle" fontSize={11} fontWeight={700} fill={color}>{left}</text>
-      </svg>
-      <span style={{ fontSize: 10, color: '#94a3b8', letterSpacing: '0.05em' }}>
-        {left <= 3 ? 'SENDING' : 'CHUNK'}
-      </span>
-    </div>
-  )
-}
-
 // ─── Controls ───────────────────────────────────────────────────────────────
 function Controls() {
   const { isListening, totalWords, sessionSecs, reset } = useStore()
-  const { start, stop, chunkStartRef } = useAudioCapture()
+  const { start, stop, isPosting } = useAudioCapture()
 
   const handleToggle = () => isListening ? stop() : start()
   const handleReset  = () => { stop(); setTimeout(reset, 100) }
@@ -246,18 +209,24 @@ function Controls() {
           <div style={label}>WORDS</div>
         </div>
 
-        {/* Countdown ring — only while listening */}
-        {isListening && <CountdownRing chunkStartRef={chunkStartRef} />}
+        {/* Analysing indicator — shown while backend is processing */}
+        {isPosting && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 7, color: '#f59e0b', fontSize: 13, fontWeight: 500 }}>
+            <span style={{ animation: 'spin 1s linear infinite', display: 'inline-block' }}>⏳</span>
+            Analysing…
+          </div>
+        )}
 
-        {/* Spacer */}
         <div style={{ flex: 1 }} />
 
         {/* Buttons */}
         <div style={{ display: 'flex', gap: 10 }}>
-          <button onClick={handleToggle} style={{
+          <button onClick={handleToggle} disabled={isPosting} style={{
             ...btn,
             background: isListening ? '#fee2e2' : '#dbeafe',
             color:      isListening ? '#dc2626' : '#2563eb',
+            opacity:    isPosting ? 0.5 : 1,
+            cursor:     isPosting ? 'not-allowed' : 'pointer',
           }}>
             <span style={{
               display: 'inline-block', width: 8, height: 8,
@@ -267,13 +236,17 @@ function Controls() {
             }}/>
             {isListening ? 'Stop' : 'Start'}
           </button>
-          <button onClick={handleReset} style={{ ...btn, background: '#f1f5f9', color: '#475569' }}>
+          <button onClick={handleReset} disabled={isPosting} style={{
+            ...btn,
+            background: '#f1f5f9', color: '#475569',
+            opacity: isPosting ? 0.5 : 1,
+            cursor:  isPosting ? 'not-allowed' : 'pointer',
+          }}>
             Reset
           </button>
         </div>
       </div>
 
-      {/* Error banner */}
       <ErrorBanner />
     </div>
   )
@@ -383,6 +356,10 @@ export default function App() {
         @keyframes pulse {
           0%, 100% { opacity: 1; }
           50%       { opacity: 0.3; }
+        }
+        @keyframes spin {
+          from { transform: rotate(0deg); }
+          to   { transform: rotate(360deg); }
         }
         button:hover { opacity: 0.85; }
       `}</style>
