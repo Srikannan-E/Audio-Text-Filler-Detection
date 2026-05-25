@@ -1,6 +1,5 @@
 [build]
 builder = "nixpacks"
-buildCommand = "pip install uv && uv pip install -r requirements.txt --system"
 
 [deploy]
 startCommand = "python -m uvicorn main:app --host 0.0.0.0 --port $PORT"
