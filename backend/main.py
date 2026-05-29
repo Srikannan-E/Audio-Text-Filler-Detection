@@ -566,6 +566,7 @@ async def transcribe(
                 "mode": "verbatim",
                 "with_timestamps": True,
                 "diarize": False,
+                "language_code": "en",
                 "prompt": FEW_SHOT_PROMPT,
             },
         )
